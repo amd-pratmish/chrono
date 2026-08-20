@@ -69,6 +69,7 @@ static constexpr gpuMemcpyKind gpuMemcpyHostToDevice = cudaMemcpyHostToDevice;
 static constexpr gpuMemcpyKind gpuMemcpyDeviceToHost = cudaMemcpyDeviceToHost;
 static constexpr gpuMemcpyKind gpuMemcpyDeviceToDevice = cudaMemcpyDeviceToDevice;
 static constexpr gpuMemoryAdvise gpuMemAdviseSetReadMostly = cudaMemAdviseSetReadMostly;
+static constexpr gpuMemoryAdvise gpuMemAdviseSetCoarseGrain = cudaMemAdviseSetCoarseGrain;
 
 // Function wrappers
 inline const char* gpuGetErrorString(gpuError err) {
@@ -127,6 +128,25 @@ inline gpuError gpuGetDevice(int* dev) {
 
 inline gpuError gpuGetDeviceProperties(gpuDeviceProp* prop, int device) {
     return cudaGetDeviceProperties(prop, device);
+}
+
+inline gpuError gpuMemPrefetchAsync(const void* ptr, std::size_t bytes, int device, gpuStream stream = 0) {
+    #if defined(CUDART_VERSION) && CUDART_VERSION >= 8000
+    #if defined(CUDART_VERSION) && CUDART_VERSION >= 13000
+    cudaMemLocation location{};
+    location.type = cudaMemLocationTypeDevice;
+    location.id = device;
+    return cudaMemPrefetchAsync(ptr, bytes, location, stream);
+    #else
+    return cudaMemPrefetchAsync(ptr, bytes, device, stream);
+    #endif
+    #else
+    (void)ptr;
+    (void)bytes;
+    (void)device;
+    (void)stream;
+    return gpuSuccess;
+    #endif
 }
 
 inline gpuError gpuMemAdvise(const void* ptr, std::size_t bytes, gpuMemoryAdvise advice, int device) {
@@ -213,6 +233,7 @@ static constexpr gpuMemcpyKind gpuMemcpyHostToDevice = hipMemcpyHostToDevice;
 static constexpr gpuMemcpyKind gpuMemcpyDeviceToHost = hipMemcpyDeviceToHost;
 static constexpr gpuMemcpyKind gpuMemcpyDeviceToDevice = hipMemcpyDeviceToDevice;
 static constexpr gpuMemoryAdvise gpuMemAdviseSetReadMostly = hipMemAdviseSetReadMostly;
+static constexpr gpuMemoryAdvise gpuMemAdviseSetCoarseGrain = hipMemAdviseSetCoarseGrain;
 
 // Function wrappers
 inline const char* gpuGetErrorString(gpuError err) {
@@ -273,6 +294,15 @@ inline gpuError gpuGetDeviceProperties(gpuDeviceProp* prop, int device) {
     return hipGetDeviceProperties(prop, device);
 }
 
+inline gpuError gpuMemPrefetchAsync(const void* ptr, std::size_t bytes, int device, gpuStream stream = 0) {
+    hipError_t err = hipMemPrefetchAsync(ptr, bytes, device, stream);
+    if (err == hipErrorInvalidValue || err == hipErrorNotSupported) {
+        (void)hipGetLastError();
+        return hipSuccess;
+    }
+    return err;
+}
+
 inline gpuError gpuMemAdvise(const void* ptr, std::size_t bytes, gpuMemoryAdvise advice, int device) {
     // Memory advice is a performance hint only. On some HIP platforms (e.g. Windows,
     // or APUs without full managed-memory support) hipMemAdvise is not implemented and
@@ -328,7 +358,7 @@ using gpuEvent = void*;
 using gpuError = int;
 
 enum gpuMemcpyKind { gpuMemcpyHostToDevice = 1, gpuMemcpyDeviceToHost = 2, gpuMemcpyDeviceToDevice = 3 };
-enum gpuMemoryAdvise { gpuMemAdviseSetReadMostly = 1 };
+enum gpuMemoryAdvise { gpuMemAdviseSetReadMostly = 1, gpuMemAdviseSetCoarseGrain = 2 };
 
 static constexpr gpuError gpuSuccess = 0;
 static constexpr gpuError gpuErrorMemoryAllocation = 2;
@@ -390,6 +420,10 @@ inline gpuError gpuGetDevice(int*) {
 }
 
 inline gpuError gpuGetDeviceProperties(gpuDeviceProp*, int) {
+    return gpuErrorNotSupported;
+}
+
+inline gpuError gpuMemPrefetchAsync(const void*, std::size_t, int, gpuStream = 0) {
     return gpuErrorNotSupported;
 }
 

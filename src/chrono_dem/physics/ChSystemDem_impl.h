@@ -25,6 +25,7 @@
 #include "chrono_dem/ChDemDefines.h"
 #include "chrono_dem/physics/ChDemBoundaryConditions.h"
 #include "chrono_dem/gpu/ChDemGpuAlloc.h"
+#include "chrono_dem/gpu/ChDemGpuMem.h"
 
 typedef unsigned char not_stupid_bool;
 
@@ -55,7 +56,7 @@ class ChSolverStateData {
     float crntSimTime_SU;   // DN: needs to be brought here from GranParams
   public:
     ChSolverStateData() {
-        demErrchk(gpuMallocManaged(&pMaxNumberSpheresInAnySD, sizeof(unsigned int)));
+        demErrchk(demGpuMallocManaged(&pMaxNumberSpheresInAnySD, sizeof(unsigned int)));
         largestMaxNumberSpheresInAnySD_thusFar = 0;
     }
     ~ChSolverStateData() { demErrchk(gpuFree(pMaxNumberSpheresInAnySD)); }
@@ -426,6 +427,12 @@ class ChSystemDem_impl {
     void runSphereBroadphase();
 
     /// Wrap the device helper function.
+    void syncBCTypeListToDevice();
+    void syncBCParamsListToDevice();
+    BC_type* bcTypeListDevicePtr() const;
+    BC_params_t<int64_t, int64_t3>* bcParamsListDevicePtr() const;
+
+    /// Update BC positions on host/device.
     int3 getSDTripletFromID(unsigned int SD_ID) const;
 
     /// Create a helper to do sphere initialization.
@@ -729,11 +736,17 @@ class ChSystemDem_impl {
     int64_t3 BD_rest_frame_SU;
 
     /// List of generalized boundary conditions that constrain sphere motion
-    std::vector<BC_type, gpuallocator<BC_type>> BC_type_list;
-    /// Sim-unit (adimensional) details of boundary conditions
-    std::vector<BC_params_t<int64_t, int64_t3>, gpuallocator<BC_params_t<int64_t, int64_t3>>> BC_params_list_SU;
-    /// User-unit (dimensional) details of boundary conditions
-    std::vector<BC_params_t<float, float3>, gpuallocator<BC_params_t<float, float3>>> BC_params_list_UU;
+    std::vector<BC_type> BC_type_list;
+    /// Device copy of BC types when bulk HIP memory policy is active (host list above is authoritative).
+    BC_type* bc_type_list_device_ = nullptr;
+    size_t bc_type_list_device_capacity_ = 0;
+    /// Sim-unit (adimensional) details of boundary conditions (host authoritative; synced to device on HIP)
+    std::vector<BC_params_t<int64_t, int64_t3>> BC_params_list_SU;
+    /// Device copy of BC params when bulk HIP memory policy is active.
+    BC_params_t<int64_t, int64_t3>* bc_params_list_SU_device_ = nullptr;
+    size_t bc_params_list_SU_device_capacity_ = 0;
+    /// User-unit (dimensional) details of boundary conditions (host-only; converted to SU on init)
+    std::vector<BC_params_t<float, float3>> BC_params_list_UU;
     /// Offset motions functions for boundary conditions -- used for moving walls, wavetanks, etc.
     std::vector<GranPositionFunction> BC_offset_function_list;
 

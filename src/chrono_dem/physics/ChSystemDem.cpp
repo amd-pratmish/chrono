@@ -20,6 +20,7 @@
 #include "chrono_dem/physics/ChSystemDemMesh_impl.h"
 
 #include "chrono_dem/utils/ChDemUtilities.h"
+#include "chrono_dem/gpu/ChDemGpuMem.h"
 
 namespace chrono {
 namespace dem {
@@ -224,6 +225,7 @@ void ChSystemDem::SetAdhesionRatio_SPH2WALL(float someValue) {
 void ChSystemDem::UseMaterialBasedModel(bool val) {
     m_sys->use_mat_based = val;
     m_sys->gran_params->use_mat_based = val;
+    demGpuPublishManagedToDevice(m_sys->gran_params, sizeof(*m_sys->gran_params));
 }
 
 void ChSystemDem::SetYoungModulus_SPH(double someValue) {
@@ -550,11 +552,11 @@ void ChSystemDemMesh::SetMeshes() {
     pMeshSoup->nTrianglesInSoup = nTriangles;
     if (nTriangles != 0) {
         // Allocate all of the requisite pointers
-        demErrchk(gpuMallocManaged(&pMeshSoup->triangleFamily_ID, nTriangles * sizeof(unsigned int), gpuMemAttachGlobal));
+        demErrchk(demGpuMallocBulk(&pMeshSoup->triangleFamily_ID, nTriangles * sizeof(unsigned int)));
 
-        demErrchk(gpuMallocManaged(&pMeshSoup->node1, nTriangles * sizeof(float3), gpuMemAttachGlobal));
-        demErrchk(gpuMallocManaged(&pMeshSoup->node2, nTriangles * sizeof(float3), gpuMemAttachGlobal));
-        demErrchk(gpuMallocManaged(&pMeshSoup->node3, nTriangles * sizeof(float3), gpuMemAttachGlobal));
+        demErrchk(demGpuMallocBulk(&pMeshSoup->node1, nTriangles * sizeof(float3)));
+        demErrchk(demGpuMallocBulk(&pMeshSoup->node2, nTriangles * sizeof(float3)));
+        demErrchk(demGpuMallocBulk(&pMeshSoup->node3, nTriangles * sizeof(float3)));
     }
 
     MESH_INFO_PRINTF("Done allocating nodes for %d triangles\n", nTriangles);
@@ -599,23 +601,23 @@ void ChSystemDemMesh::SetMeshes() {
     pMeshSoup->numTriangleFamilies = family;
 
     if (pMeshSoup->nTrianglesInSoup != 0) {
-        demErrchk(gpuMallocManaged(&pMeshSoup->familyMass_SU, family * sizeof(float), gpuMemAttachGlobal));
+        demErrchk(demGpuMallocBulk(&pMeshSoup->familyMass_SU, family * sizeof(float)));
 
         for (unsigned int i = 0; i < family; i++) {
             // NOTE The SU conversion is done in initialize after the scaling is determined
             pMeshSoup->familyMass_SU[i] = m_mesh_masses[i];
         }
 
-        demErrchk(gpuMallocManaged(&pMeshSoup->generalizedForcesPerFamily, 6 * pMeshSoup->numTriangleFamilies * sizeof(float), gpuMemAttachGlobal));
+        demErrchk(demGpuMallocBulk(&pMeshSoup->generalizedForcesPerFamily, 6 * pMeshSoup->numTriangleFamilies * sizeof(float)));
         // Allocate memory for the float and double frames
         demErrchk(
-            gpuMallocManaged(&sys_trimesh->getTriParams()->fam_frame_broad, pMeshSoup->numTriangleFamilies * sizeof(ChSystemDemMesh_impl::MeshFrame<float>), gpuMemAttachGlobal));
+            demGpuMallocBulk(&sys_trimesh->getTriParams()->fam_frame_broad, pMeshSoup->numTriangleFamilies * sizeof(ChSystemDemMesh_impl::MeshFrame<float>)));
         demErrchk(
-            gpuMallocManaged(&sys_trimesh->getTriParams()->fam_frame_narrow, pMeshSoup->numTriangleFamilies * sizeof(ChSystemDemMesh_impl::MeshFrame<double>), gpuMemAttachGlobal));
+            demGpuMallocBulk(&sys_trimesh->getTriParams()->fam_frame_narrow, pMeshSoup->numTriangleFamilies * sizeof(ChSystemDemMesh_impl::MeshFrame<double>)));
 
         // Allocate memory for linear and angular velocity
-        demErrchk(gpuMallocManaged(&pMeshSoup->vel, pMeshSoup->numTriangleFamilies * sizeof(float3), gpuMemAttachGlobal));
-        demErrchk(gpuMallocManaged(&pMeshSoup->omega, pMeshSoup->numTriangleFamilies * sizeof(float3), gpuMemAttachGlobal));
+        demErrchk(demGpuMallocBulk(&pMeshSoup->vel, pMeshSoup->numTriangleFamilies * sizeof(float3)));
+        demErrchk(demGpuMallocBulk(&pMeshSoup->omega, pMeshSoup->numTriangleFamilies * sizeof(float3)));
 
         for (unsigned int i = 0; i < family; i++) {
             pMeshSoup->vel[i] = make_float3(0, 0, 0);

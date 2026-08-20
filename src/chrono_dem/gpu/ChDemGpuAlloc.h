@@ -1,4 +1,3 @@
-
 // =============================================================================
 // PROJECT CHRONO - http://projectchrono.org
 //
@@ -26,6 +25,7 @@
 #include <utility>
 
 #include "chrono_dem/ChDemDefines.h"
+#include "chrono_dem/gpu/ChDemGpuMem.h"
 
 ////#if (__cplusplus >= 201703L)  // C++17 or newer
 ////template <class T>
@@ -78,14 +78,34 @@ class gpuallocator {
 
     template <class... Args>
     void construct(T* p, Args&&... args) {
+#if defined(CHRONO_USE_HIP)
+        if (chrono::dem::demGpuUsesDeviceMemory()) {
+            T value(std::forward<Args>(args)...);
+            (void)gpuMemcpy(p, &value, sizeof(T), gpuMemcpyHostToDevice);
+            return;
+        }
+#endif
         ::new ((void*)p) T(std::forward<Args>(args)...);
     }
-    void destroy(T* p) { p->~T(); }
+    void destroy(T* p) {
+#if defined(CHRONO_USE_HIP)
+        if (chrono::dem::demGpuUsesDeviceMemory()) {
+            return;
+        }
+#endif
+        p->~T();
+    }
     ////#endif
 
     pointer allocate(size_type n, std::allocator<void>::const_pointer hint = 0) {
-        void* vptr;
-        gpuError err = gpuMallocManaged(&vptr, n * sizeof(T), gpuMemAttachGlobal);
+        (void)hint;
+        void* vptr = nullptr;
+        gpuError err = gpuSuccess;
+        if (chrono::dem::demGpuUsesDeviceMemory()) {
+            err = gpuMalloc(&vptr, n * sizeof(T));
+        } else {
+            err = gpuMallocManaged(&vptr, n * sizeof(T), gpuMemAttachGlobal);
+        }
         if (err == gpuErrorMemoryAllocation || err == gpuErrorNotSupported) {
             throw std::bad_alloc();
         }
@@ -93,6 +113,7 @@ class gpuallocator {
     }
 
     void deallocate(pointer p, size_type n) {
+        (void)n;
         if (p) {
             demErrchk(gpuFree(p));
         }

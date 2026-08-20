@@ -93,6 +93,12 @@ constexpr size_t NUM_RESERVED_BC_IDS = 6;
 #define MAX_TRIANGLE_COUNT_PER_SD 512u
 /// Number of threads in a block when that number is allowed to vary.
 #define GPU_THREADS_PER_BLOCK 128
+#if defined(CHRONO_USE_HIP)
+/// Wider blocks for 1:1 sphere contact/integration kernels on CDNA (MI300X/MI350X).
+#define GPU_CONTACT_THREADS_PER_BLOCK 256
+#else
+#define GPU_CONTACT_THREADS_PER_BLOCK GPU_THREADS_PER_BLOCK
+#endif
 
 // NOTE this may change in the future, but until then this is sufficient
 constexpr int warp_size = 32;

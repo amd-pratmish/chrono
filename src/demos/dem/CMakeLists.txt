@@ -8,6 +8,7 @@ set(DEMOS
     demo_DEM_fixedTerrain
     demo_DEM_mixer
     demo_DEM_repose
+    demo_DEM_settling_bench
 )
 
 # ------------------------------------------------------------------------------

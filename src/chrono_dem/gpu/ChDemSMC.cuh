@@ -47,6 +47,23 @@ using chrono::dem::CHDEM_TIME_INTEGRATOR;
 using chrono::dem::CHDEM_FRICTION_MODE;
 using chrono::dem::CHDEM_ROLLING_MODE;
 
+/// Zero BC reaction force accumulators on the device (avoids host-side managed-memory writes each step).
+static __global__ void resetBCForces_kernel(BC_params_t<int64_t, int64_t3>* bc_params_list,
+                                            BC_type* bc_type_list,
+                                            unsigned int nBCs) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nBCs) {
+        return;
+    }
+    if (!bc_params_list[i].track_forces) {
+        return;
+    }
+    bc_params_list[i].reaction_forces = {0, 0, 0};
+    if (bc_type_list[i] == BC_type::SPHERE) {
+        bc_params_list[i].sphere_params.reaction_torques = {0, 0, 0};
+    }
+}
+
 /// @addtogroup dem_gpu
 /// @{
 
@@ -323,17 +340,19 @@ inline __device__ void findNewLocalCoords(ChSystemDem_impl::GranSphereDataPtr sp
                                           int64_t global_pos_Y,
                                           int64_t global_pos_Z,
                                           ChSystemDem_impl::GranParamsPtr gran_params) {
-    int3 ownerSD = pointSDTriplet(global_pos_X, global_pos_Y, global_pos_Z, gran_params);
+    const int64_t sphCenter_X_modified = -gran_params->BD_frame_X + global_pos_X;
+    const int64_t sphCenter_Y_modified = -gran_params->BD_frame_Y + global_pos_Y;
+    const int64_t sphCenter_Z_modified = -gran_params->BD_frame_Z + global_pos_Z;
 
-    // printf("sphere %u, ownerSD is %d, %d, %d\n", mySphereID, ownerSD.x, ownerSD.y, ownerSD.z);
+    int3 ownerSD;
+    ownerSD.x = (int)demDivFloorSD(sphCenter_X_modified, (int64_t)gran_params->SD_size_X_SU);
+    ownerSD.y = (int)demDivFloorSD(sphCenter_Y_modified, (int64_t)gran_params->SD_size_Y_SU);
+    ownerSD.z = (int)demDivFloorSD(sphCenter_Z_modified, (int64_t)gran_params->SD_size_Z_SU);
 
-    // now compute positions local to that SD
-    // compute in 64 bit and cast to 32 bit
-    // NOTE this assumes that we can store a local pos in 32 bits
-    // local = global - SD = frame + global - frame_to_SD
-    int sphere_pos_local_X = (int)(-gran_params->BD_frame_X + global_pos_X - (int64_t)ownerSD.x * gran_params->SD_size_X_SU);
-    int sphere_pos_local_Y = (int)(-gran_params->BD_frame_Y + global_pos_Y - (int64_t)ownerSD.y * gran_params->SD_size_Y_SU);
-    int sphere_pos_local_Z = (int)(-gran_params->BD_frame_Z + global_pos_Z - (int64_t)ownerSD.z * gran_params->SD_size_Z_SU);
+    // local = modified - ownerSD * SD_size (consistent with host SetParticlePosition)
+    int sphere_pos_local_X = (int)(sphCenter_X_modified - (int64_t)ownerSD.x * gran_params->SD_size_X_SU);
+    int sphere_pos_local_Y = (int)(sphCenter_Y_modified - (int64_t)ownerSD.y * gran_params->SD_size_Y_SU);
+    int sphere_pos_local_Z = (int)(sphCenter_Z_modified - (int64_t)ownerSD.z * gran_params->SD_size_Z_SU);
 
     // printf("sphere %u, BD offsets are %lld, %lld, %lld\n", mySphereID, -gran_params->BD_frame_X,
     //        -gran_params->BD_frame_Y, -gran_params->BD_frame_Z);
@@ -346,7 +365,11 @@ inline __device__ void findNewLocalCoords(ChSystemDem_impl::GranSphereDataPtr sp
     //        global_pos_X, global_pos_Y, global_pos_Z, sphere_pos_local_X, sphere_pos_local_Y, sphere_pos_local_Z,
     //        SDTripletID(ownerSD, gran_params));
 
-    unsigned int SDID = SDTripletID(ownerSD, gran_params);
+    const unsigned int SDID = SDTripletID(ownerSD, gran_params);
+
+    if (SDID >= gran_params->nSDs) {
+        ABORTABORTABORT("ERROR! Sphere %u has invalid SD %u, max is %u, triplet %d, %d, %d\n", mySphereID, SDID, gran_params->nSDs, ownerSD.x, ownerSD.y, ownerSD.z);
+    }
 
     if (sphere_pos_local_X < 0 || sphere_pos_local_Y < 0 || sphere_pos_local_Z < 0) {
         float l_unit = gran_params->LENGTH_UNIT;
@@ -364,12 +387,6 @@ inline __device__ void findNewLocalCoords(ChSystemDem_impl::GranSphereDataPtr sp
     sphere_data->sphere_local_pos_X[mySphereID] = sphere_pos_local_X;
     sphere_data->sphere_local_pos_Y[mySphereID] = sphere_pos_local_Y;
     sphere_data->sphere_local_pos_Z[mySphereID] = sphere_pos_local_Z;
-
-    if (SDID >= gran_params->nSDs) {
-        unsigned int mySphereID = threadIdx.x + blockIdx.x * blockDim.x;
-
-        ABORTABORTABORT("ERROR! Sphere %u has invalid SD %u, max is %u, triplet %d, %d, %d\n", mySphereID, SDID, gran_params->nSDs, ownerSD.x, ownerSD.y, ownerSD.z);
-    }
 
     // write back which SD currently owns this sphere
     sphere_data->sphere_owner_SDs[mySphereID] = SDID;
@@ -703,6 +720,25 @@ inline __device__ float3 computeSphereNormalForces_matBased(float3& vrel_t,
     return force_accum;
 }
 
+/// Per-sphere contact kernels use a 1:1 thread-to-sphere map and acc arrays are zeroed each step,
+/// so direct stores are safe and avoid system-scope atomic overhead on managed/HIP memory.
+inline __device__ void writeSphereAccelerationsFromForce(ChSystemDem_impl::GranSphereDataPtr sphere_data,
+                                                         ChSystemDem_impl::GranParamsPtr gran_params,
+                                                         unsigned int mySphereID,
+                                                         float3 bodyA_force,
+                                                         float3 bodyA_AngAcc) {
+    const float inv_mass = 1.f / gran_params->sphere_mass_SU;
+    sphere_data->sphere_acc_X[mySphereID] = bodyA_force.x * inv_mass;
+    sphere_data->sphere_acc_Y[mySphereID] = bodyA_force.y * inv_mass;
+    sphere_data->sphere_acc_Z[mySphereID] = bodyA_force.z * inv_mass;
+
+    if (gran_params->friction_mode == CHDEM_FRICTION_MODE::SINGLE_STEP || gran_params->friction_mode == CHDEM_FRICTION_MODE::MULTI_STEP) {
+        sphere_data->sphere_ang_acc_X[mySphereID] = bodyA_AngAcc.x;
+        sphere_data->sphere_ang_acc_Y[mySphereID] = bodyA_AngAcc.y;
+        sphere_data->sphere_ang_acc_Z[mySphereID] = bodyA_AngAcc.z;
+    }
+}
+
 /// each thread is a sphere, computing the forces its contact partners exert on it
 static __global__ void computeSphereContactForces(ChSystemDem_impl::GranSphereDataPtr sphere_data,
                                                   ChSystemDem_impl::GranParamsPtr gran_params,
@@ -853,16 +889,7 @@ static __global__ void computeSphereContactForces(ChSystemDem_impl::GranSphereDa
         // add in gravity and wall forces
         applyExternalForces(mySphereID, myOwnerSD, my_sphere_pos, my_sphere_vel, my_omega, bodyA_force, bodyA_AngAcc, gran_params, sphere_data, bc_type_list, bc_params_list, nBCs);
 
-        // Write the force back to global memory so that we can apply them AFTER this kernel finishes
-        atomicAdd(sphere_data->sphere_acc_X + mySphereID, bodyA_force.x / gran_params->sphere_mass_SU);
-        atomicAdd(sphere_data->sphere_acc_Y + mySphereID, bodyA_force.y / gran_params->sphere_mass_SU);
-        atomicAdd(sphere_data->sphere_acc_Z + mySphereID, bodyA_force.z / gran_params->sphere_mass_SU);
-
-        if (gran_params->friction_mode == CHDEM_FRICTION_MODE::SINGLE_STEP || gran_params->friction_mode == CHDEM_FRICTION_MODE::MULTI_STEP) {
-            atomicAdd(sphere_data->sphere_ang_acc_X + mySphereID, bodyA_AngAcc.x);
-            atomicAdd(sphere_data->sphere_ang_acc_Y + mySphereID, bodyA_AngAcc.y);
-            atomicAdd(sphere_data->sphere_ang_acc_Z + mySphereID, bodyA_AngAcc.z);
-        }
+        writeSphereAccelerationsFromForce(sphere_data, gran_params, mySphereID, bodyA_force, bodyA_AngAcc);
     }
 }
 
@@ -1025,16 +1052,7 @@ static __global__ void computeSphereContactForces_matBased(ChSystemDem_impl::Gra
         // add in gravity and wall forces
         applyExternalForces(mySphereID, myOwnerSD, my_sphere_pos, my_sphere_vel, my_omega, bodyA_force, bodyA_AngAcc, gran_params, sphere_data, bc_type_list, bc_params_list, nBCs);
 
-        // Write the force back to global memory so that we can apply them AFTER this kernel finishes
-        atomicAdd(sphere_data->sphere_acc_X + mySphereID, bodyA_force.x / gran_params->sphere_mass_SU);
-        atomicAdd(sphere_data->sphere_acc_Y + mySphereID, bodyA_force.y / gran_params->sphere_mass_SU);
-        atomicAdd(sphere_data->sphere_acc_Z + mySphereID, bodyA_force.z / gran_params->sphere_mass_SU);
-
-        if (gran_params->friction_mode == CHDEM_FRICTION_MODE::SINGLE_STEP || gran_params->friction_mode == CHDEM_FRICTION_MODE::MULTI_STEP) {
-            atomicAdd(sphere_data->sphere_ang_acc_X + mySphereID, bodyA_AngAcc.x);
-            atomicAdd(sphere_data->sphere_ang_acc_Y + mySphereID, bodyA_AngAcc.y);
-            atomicAdd(sphere_data->sphere_ang_acc_Z + mySphereID, bodyA_AngAcc.z);
-        }
+        writeSphereAccelerationsFromForce(sphere_data, gran_params, mySphereID, bodyA_force, bodyA_AngAcc);
     }
 }
 

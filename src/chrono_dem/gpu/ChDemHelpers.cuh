@@ -36,6 +36,18 @@ using chrono::dem::CHDEM_ROLLING_MODE;
 
 #define CHDEM_DEBUG_PRINTF(...) printf(__VA_ARGS__)
 
+/// Floor division for positive divisors (subdomain cell size in SU).
+/// Truncation toward zero maps negative bucket coordinates to index 0 and yields bogus negative local SD coords.
+inline __host__ __device__ int64_t demDivFloorSD(int64_t numer, int64_t denom) {
+    if (denom <= 0) {
+        return numer / denom;
+    }
+    if (numer >= 0) {
+        return numer / denom;
+    }
+    return (numer - denom + 1) / denom;
+}
+
 // Decide which SD owns this point in space
 // Pass it the Center of Mass location for a DE to get its owner, also used to get contact point
 inline __device__ int3 pointSDTriplet(int64_t sphCenter_X, int64_t sphCenter_Y, int64_t sphCenter_Z, ChSystemDem_impl::GranParamsPtr gran_params) {
@@ -47,11 +59,9 @@ inline __device__ int3 pointSDTriplet(int64_t sphCenter_X, int64_t sphCenter_Y, 
     // printf("PST: global is %lld, %lld, %lld, modified is %lld, %lld, %lld\n", sphCenter_X, sphCenter_Y, sphCenter_Z,
     //        sphCenter_X_modified, sphCenter_Y_modified, sphCenter_Z_modified);
     int3 n;
-    // Get the SD of the sphere's center in the xdir
-    n.x = (sphCenter_X_modified / (int64_t)gran_params->SD_size_X_SU);
-    // Same for D and H
-    n.y = (sphCenter_Y_modified / (int64_t)gran_params->SD_size_Y_SU);
-    n.z = (sphCenter_Z_modified / (int64_t)gran_params->SD_size_Z_SU);
+    n.x = (int)demDivFloorSD(sphCenter_X_modified, (int64_t)gran_params->SD_size_X_SU);
+    n.y = (int)demDivFloorSD(sphCenter_Y_modified, (int64_t)gran_params->SD_size_Y_SU);
+    n.z = (int)demDivFloorSD(sphCenter_Z_modified, (int64_t)gran_params->SD_size_Z_SU);
     return n;
 }
 

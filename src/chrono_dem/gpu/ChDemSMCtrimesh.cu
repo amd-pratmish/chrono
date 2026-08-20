@@ -691,12 +691,12 @@ __host__ double ChSystemDemMesh_impl::AdvanceSimulation(float duration) {
             // Compute sphere-sphere forces
             if (gran_params->use_mat_based == true) {
                 METRICS_PRINTF("use material based model\n");
-                computeSphereForces_frictionless_matBased<<<nSDs, MAX_COUNT_OF_SPHERES_PER_SD>>>(sphere_data, gran_params, BC_type_list.data(), BC_params_list_SU.data(),
+                computeSphereForces_frictionless_matBased<<<nSDs, MAX_COUNT_OF_SPHERES_PER_SD>>>(sphere_data, gran_params, bcTypeListDevicePtr(), bcParamsListDevicePtr(),
                                                                                                  (unsigned int)BC_params_list_SU.size());
 
             } else {
                 METRICS_PRINTF("use user defined model\n");
-                computeSphereForces_frictionless<<<nSDs, MAX_COUNT_OF_SPHERES_PER_SD>>>(sphere_data, gran_params, BC_type_list.data(), BC_params_list_SU.data(),
+                computeSphereForces_frictionless<<<nSDs, MAX_COUNT_OF_SPHERES_PER_SD>>>(sphere_data, gran_params, bcTypeListDevicePtr(), bcParamsListDevicePtr(),
                                                                                         (unsigned int)BC_params_list_SU.size());
             }
             demErrchk(gpuPeekAtLastError());
@@ -711,11 +711,11 @@ __host__ double ChSystemDemMesh_impl::AdvanceSimulation(float duration) {
             METRICS_PRINTF("Frictional case.\n");
             if (gran_params->use_mat_based == true) {
                 METRICS_PRINTF("compute sphere-sphere and sphere-bc mat based\n");
-                computeSphereContactForces_matBased<<<nBlocks, GPU_THREADS_PER_BLOCK>>>(sphere_data, gran_params, BC_type_list.data(), BC_params_list_SU.data(),
+                computeSphereContactForces_matBased<<<nBlocks, GPU_THREADS_PER_BLOCK>>>(sphere_data, gran_params, bcTypeListDevicePtr(), bcParamsListDevicePtr(),
                                                                                         (unsigned int)BC_params_list_SU.size(), nSpheres);
             } else {
                 METRICS_PRINTF("compute sphere-sphere and sphere-bc user defined\n");
-                computeSphereContactForces<<<nBlocks, GPU_THREADS_PER_BLOCK>>>(sphere_data, gran_params, BC_type_list.data(), BC_params_list_SU.data(),
+                computeSphereContactForces<<<nBlocks, GPU_THREADS_PER_BLOCK>>>(sphere_data, gran_params, bcTypeListDevicePtr(), bcParamsListDevicePtr(),
                                                                                (unsigned int)BC_params_list_SU.size(), nSpheres);
             }
         }

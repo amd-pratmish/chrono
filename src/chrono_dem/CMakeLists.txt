@@ -81,6 +81,7 @@ set(DEM_GPU_FILES
     gpu/ChDemHelpers.cuh
     gpu/ChDemBoxTriangle.cuh
     gpu/ChDemGpuAlloc.h
+    gpu/ChDemGpuMem.h
     gpu/ChDemGpuMathUtils.cuh
     ../chrono/gpu/ChGpuRuntime.h
     ../chrono/gpu/ChGpuPrimitives.h
@@ -198,6 +199,8 @@ elseif(CHRONO_HIP_FOUND)
       target_link_options(Chrono_dem PRIVATE $<$<LINK_LANGUAGE:HIP>:--offload-arch=${_chrono_hip_arch}>)
     endforeach()
   endif()
+  target_compile_options(Chrono_dem PRIVATE
+    $<$<COMPILE_LANGUAGE:HIP>:-O3 -ffast-math -mllvm -amdgpu-early-inline-all=true>)
 endif()
 
 install(TARGETS Chrono_dem

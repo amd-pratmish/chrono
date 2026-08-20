@@ -25,6 +25,8 @@
 #include "chrono_dem/physics/ChDemBoundaryConditions.h"
 #include "chrono_dem/utils/ChDemUtilities.h"
 #include "chrono_dem/gpu/ChDemGpuMathUtils.cuh"
+#include "chrono_dem/gpu/ChDemGpuMem.h"
+#include "chrono_dem/gpu/ChDemHelpers.cuh"
 
 #ifdef USE_HDF5
     #include "H5Cpp.h"
@@ -76,8 +78,8 @@ ChSystemDem_impl::ChSystemDem_impl(float sphere_rad, float density, float3 boxDi
       rolling_coeff_s2w_UU(0.0),
       spinning_coeff_s2s_UU(0.0),
       spinning_coeff_s2w_UU(0.0) {
-    demErrchk(gpuMallocManaged(&gran_params, sizeof(GranParams), gpuMemAttachGlobal));
-    demErrchk(gpuMallocManaged(&sphere_data, sizeof(SphereData), gpuMemAttachGlobal));
+    demErrchk(demGpuMallocManaged(&gran_params, sizeof(GranParams), gpuMemAttachGlobal));
+    demErrchk(demGpuMallocManaged(&sphere_data, sizeof(SphereData), gpuMemAttachGlobal));
     psi_T = PSI_T_DEFAULT;
     psi_L = PSI_L_DEFAULT;
     psi_R = PSI_R_DEFAULT;
@@ -92,6 +94,7 @@ ChSystemDem_impl::ChSystemDem_impl(float sphere_rad, float density, float3 boxDi
 
     gran_params->static_friction_coeff_s2s = 0;
     gran_params->static_friction_coeff_s2w = 0;
+    gran_params->use_mat_based = use_mat_based;
 
     // Reserve seats for big box domain BCs
     BC_type_list.resize(NUM_RESERVED_BC_IDS);
@@ -132,7 +135,60 @@ void ChSystemDem_impl::CreateWallBCs() {
 }
 
 ChSystemDem_impl::~ChSystemDem_impl() {
+    if (bc_type_list_device_ != nullptr) {
+        demErrchk(gpuFree(bc_type_list_device_));
+        bc_type_list_device_ = nullptr;
+    }
+    if (bc_params_list_SU_device_ != nullptr) {
+        demErrchk(gpuFree(bc_params_list_SU_device_));
+        bc_params_list_SU_device_ = nullptr;
+    }
     demErrchk(gpuFree(gran_params));
+}
+
+void ChSystemDem_impl::syncBCTypeListToDevice() {
+    const size_t n = BC_type_list.size();
+    if (n == 0) {
+        return;
+    }
+    if (bc_type_list_device_ == nullptr || bc_type_list_device_capacity_ < n) {
+        if (bc_type_list_device_ != nullptr) {
+            demErrchk(gpuFree(bc_type_list_device_));
+            bc_type_list_device_ = nullptr;
+        }
+        demErrchk(demGpuMallocBulk(&bc_type_list_device_, n * sizeof(BC_type)));
+        bc_type_list_device_capacity_ = n;
+    }
+    demGpuCopyFromHost(bc_type_list_device_, BC_type_list.data(), n);
+}
+
+BC_type* ChSystemDem_impl::bcTypeListDevicePtr() const {
+    return bc_type_list_device_;
+}
+
+void ChSystemDem_impl::syncBCParamsListToDevice() {
+    const size_t n = BC_params_list_SU.size();
+    if (n == 0) {
+        if (bc_params_list_SU_device_ != nullptr) {
+            demErrchk(gpuFree(bc_params_list_SU_device_));
+            bc_params_list_SU_device_ = nullptr;
+            bc_params_list_SU_device_capacity_ = 0;
+        }
+        return;
+    }
+    if (bc_params_list_SU_device_ == nullptr || bc_params_list_SU_device_capacity_ < n) {
+        if (bc_params_list_SU_device_ != nullptr) {
+            demErrchk(gpuFree(bc_params_list_SU_device_));
+            bc_params_list_SU_device_ = nullptr;
+        }
+        demErrchk(demGpuMallocBulk(&bc_params_list_SU_device_, n * sizeof(BC_params_t<int64_t, int64_t3>)));
+        bc_params_list_SU_device_capacity_ = n;
+    }
+    demGpuCopyFromHost(bc_params_list_SU_device_, BC_params_list_SU.data(), n);
+}
+
+BC_params_t<int64_t, int64_t3>* ChSystemDem_impl::bcParamsListDevicePtr() const {
+    return bc_params_list_SU_device_;
 }
 
 size_t ChSystemDem_impl::EstimateMemUsage() const {
@@ -279,13 +335,58 @@ void ChSystemDem_impl::WriteCsvParticles(std::ofstream& ptFile) const {
     }
 
     outstrstream << "\n";
+
+    const bool device_bulk = demGpuUsesDeviceMemory();
+    std::vector<int> h_lpx, h_lpy, h_lpz;
+    std::vector<unsigned int> h_owner;
+    std::vector<float> h_vx, h_vy, h_vz, h_wx, h_wy, h_wz, h_ax, h_ay, h_az;
+    std::vector<not_stupid_bool> h_fixed;
+    if (device_bulk && nSpheres > 0) {
+        h_lpx.resize(nSpheres);
+        h_lpy.resize(nSpheres);
+        h_lpz.resize(nSpheres);
+        h_owner.resize(nSpheres);
+        demGpuCopyToHost(sphere_local_pos_X.data(), h_lpx.data(), nSpheres);
+        demGpuCopyToHost(sphere_local_pos_Y.data(), h_lpy.data(), nSpheres);
+        demGpuCopyToHost(sphere_local_pos_Z.data(), h_lpz.data(), nSpheres);
+        demGpuCopyToHost(sphere_owner_SDs.data(), h_owner.data(), nSpheres);
+        if (GET_OUTPUT_SETTING(VEL_COMPONENTS) || GET_OUTPUT_SETTING(ABSV)) {
+            h_vx.resize(nSpheres);
+            h_vy.resize(nSpheres);
+            h_vz.resize(nSpheres);
+            demGpuCopyToHost(pos_X_dt.data(), h_vx.data(), nSpheres);
+            demGpuCopyToHost(pos_Y_dt.data(), h_vy.data(), nSpheres);
+            demGpuCopyToHost(pos_Z_dt.data(), h_vz.data(), nSpheres);
+        }
+        if (GET_OUTPUT_SETTING(FIXITY)) {
+            h_fixed.resize(nSpheres);
+            demGpuCopyToHost(sphere_fixed.data(), h_fixed.data(), nSpheres);
+        }
+        if (gran_params->friction_mode != CHDEM_FRICTION_MODE::FRICTIONLESS && GET_OUTPUT_SETTING(ANG_VEL_COMPONENTS)) {
+            h_wx.resize(nSpheres);
+            h_wy.resize(nSpheres);
+            h_wz.resize(nSpheres);
+            demGpuCopyToHost(sphere_Omega_X.data(), h_wx.data(), nSpheres);
+            demGpuCopyToHost(sphere_Omega_Y.data(), h_wy.data(), nSpheres);
+            demGpuCopyToHost(sphere_Omega_Z.data(), h_wz.data(), nSpheres);
+        }
+        if (GET_OUTPUT_SETTING(FORCE_COMPONENTS)) {
+            h_ax.resize(nSpheres);
+            h_ay.resize(nSpheres);
+            h_az.resize(nSpheres);
+            demGpuCopyToHost(sphere_acc_X.data(), h_ax.data(), nSpheres);
+            demGpuCopyToHost(sphere_acc_Y.data(), h_ay.data(), nSpheres);
+            demGpuCopyToHost(sphere_acc_Z.data(), h_az.data(), nSpheres);
+        }
+    }
+
     for (unsigned int n = 0; n < nSpheres; n++) {
-        unsigned int ownerSD = sphere_owner_SDs.at(n);
+        unsigned int ownerSD = device_bulk ? h_owner[n] : sphere_owner_SDs.at(n);
         int3 ownerSD_trip = getSDTripletFromID(ownerSD);
 
-        float x_UU = (float)(sphere_local_pos_X[n] * LENGTH_SU2UU);
-        float y_UU = (float)(sphere_local_pos_Y[n] * LENGTH_SU2UU);
-        float z_UU = (float)(sphere_local_pos_Z[n] * LENGTH_SU2UU);
+        float x_UU = (float)((device_bulk ? h_lpx[n] : sphere_local_pos_X[n]) * LENGTH_SU2UU);
+        float y_UU = (float)((device_bulk ? h_lpy[n] : sphere_local_pos_Y[n]) * LENGTH_SU2UU);
+        float z_UU = (float)((device_bulk ? h_lpz[n] : sphere_local_pos_Z[n]) * LENGTH_SU2UU);
 
         x_UU += (float)(gran_params->BD_frame_X * LENGTH_SU2UU);
         y_UU += (float)(gran_params->BD_frame_Y * LENGTH_SU2UU);
@@ -298,31 +399,36 @@ void ChSystemDem_impl::WriteCsvParticles(std::ofstream& ptFile) const {
         outstrstream << x_UU << "," << y_UU << "," << z_UU;
 
         if (GET_OUTPUT_SETTING(VEL_COMPONENTS)) {
-            float vx_UU = (float)(pos_X_dt[n] * LENGTH_SU2UU / TIME_SU2UU);
-            float vy_UU = (float)(pos_Y_dt[n] * LENGTH_SU2UU / TIME_SU2UU);
-            float vz_UU = (float)(pos_Z_dt[n] * LENGTH_SU2UU / TIME_SU2UU);
+            float vx_UU = (float)((device_bulk ? h_vx[n] : pos_X_dt[n]) * LENGTH_SU2UU / TIME_SU2UU);
+            float vy_UU = (float)((device_bulk ? h_vy[n] : pos_Y_dt[n]) * LENGTH_SU2UU / TIME_SU2UU);
+            float vz_UU = (float)((device_bulk ? h_vz[n] : pos_Z_dt[n]) * LENGTH_SU2UU / TIME_SU2UU);
 
             outstrstream << "," << vx_UU << "," << vy_UU << "," << vz_UU;
         }
 
         if (GET_OUTPUT_SETTING(ABSV)) {
-            float absv = (float)(std::sqrt(pos_X_dt.at(n) * pos_X_dt.at(n) + pos_Y_dt.at(n) * pos_Y_dt.at(n) + pos_Z_dt.at(n) * pos_Z_dt.at(n)) * VEL_SU2UU);
+            const float px = device_bulk ? h_vx[n] : pos_X_dt.at(n);
+            const float py = device_bulk ? h_vy[n] : pos_Y_dt.at(n);
+            const float pz = device_bulk ? h_vz[n] : pos_Z_dt.at(n);
+            float absv = (float)(std::sqrt(px * px + py * py + pz * pz) * VEL_SU2UU);
             outstrstream << "," << absv;
         }
 
         if (GET_OUTPUT_SETTING(FIXITY)) {
-            int fixed = (int)sphere_fixed[n];
+            int fixed = (int)(device_bulk ? h_fixed[n] : sphere_fixed[n]);
             outstrstream << "," << fixed;
         }
 
         if (gran_params->friction_mode != CHDEM_FRICTION_MODE::FRICTIONLESS && GET_OUTPUT_SETTING(ANG_VEL_COMPONENTS)) {
-            outstrstream << "," << sphere_Omega_X.at(n) / TIME_SU2UU << "," << sphere_Omega_Y.at(n) / TIME_SU2UU << "," << sphere_Omega_Z.at(n) / TIME_SU2UU;
+            outstrstream << "," << (device_bulk ? h_wx[n] : sphere_Omega_X.at(n)) / TIME_SU2UU << ","
+                         << (device_bulk ? h_wy[n] : sphere_Omega_Y.at(n)) / TIME_SU2UU << ","
+                         << (device_bulk ? h_wz[n] : sphere_Omega_Z.at(n)) / TIME_SU2UU;
         }
 
         if (GET_OUTPUT_SETTING(FORCE_COMPONENTS)) {
-            double fx = (sphere_acc_X.at(n) - gran_params->gravAcc_X_SU) * gran_params->sphere_mass_SU * FORCE_SU2UU;
-            double fy = (sphere_acc_Y.at(n) - gran_params->gravAcc_Y_SU) * gran_params->sphere_mass_SU * FORCE_SU2UU;
-            double fz = (sphere_acc_Z.at(n) - gran_params->gravAcc_Z_SU) * gran_params->sphere_mass_SU * FORCE_SU2UU;
+            double fx = ((device_bulk ? h_ax[n] : sphere_acc_X.at(n)) - gran_params->gravAcc_X_SU) * gran_params->sphere_mass_SU * FORCE_SU2UU;
+            double fy = ((device_bulk ? h_ay[n] : sphere_acc_Y.at(n)) - gran_params->gravAcc_Y_SU) * gran_params->sphere_mass_SU * FORCE_SU2UU;
+            double fz = ((device_bulk ? h_az[n] : sphere_acc_Z.at(n)) - gran_params->gravAcc_Z_SU) * gran_params->sphere_mass_SU * FORCE_SU2UU;
             outstrstream << "," << fx << "," << fy << "," << fz;
         }
 
@@ -634,20 +740,6 @@ void ChSystemDem_impl::WriteContactInfoFile(const std::string& outfilename) cons
     }
 }
 
-// Reset broadphase data structures
-void ChSystemDem_impl::resetBCForces() {
-    // zero out reaction forces on each BC
-    for (unsigned int i = 0; i < BC_params_list_SU.size(); i++) {
-        if (BC_params_list_SU.at(i).track_forces) {
-            BC_params_list_SU.at(i).reaction_forces = {0, 0, 0};
-
-            if (BC_type_list.at(i) == BC_type::SPHERE) {
-                BC_params_list_SU.at(i).sphere_params.reaction_torques = {0, 0, 0};
-            }
-        }
-    }
-}
-
 // Copy constant sphere data to device, this should run at start
 void ChSystemDem_impl::copyConstSphereDataToDevice() {
     gran_params->max_x_pos = ((int64_t)gran_params->SD_size_X_SU * gran_params->nSDs_X);
@@ -678,6 +770,7 @@ void ChSystemDem_impl::copyConstSphereDataToDevice() {
 
     // NOTE: Assumes mass = 1
     gran_params->sphereInertia_by_r = (float)((2.0 / 5.0) * gran_params->sphere_mass_SU * gran_params->sphereRadius_SU);
+    demGpuPublishManagedToDevice(gran_params, sizeof(*gran_params));
 }
 
 size_t ChSystemDem_impl::CreateBCSphere(float center[3], float radius, bool outward_normal, bool track_forces, float mass) {
@@ -841,7 +934,8 @@ size_t ChSystemDem_impl::CreateBCCylinderZ(float center[3], float radius, bool o
 
 double ChSystemDem_impl::get_max_K() const {
     double maxK;
-    if (gran_params->use_mat_based == true) {
+    const bool mat_based = use_mat_based || gran_params->use_mat_based;
+    if (mat_based == true) {
         // material pparameter sigma for different surface
         // see reference eq 2.13, 2.14 in Book Contact Force Model, Flores and Lankarani
         double sigma_sphere = (1 - std::pow(PoissonRatio_sphere_UU, 2)) / YoungsModulus_sphere_UU;
@@ -972,6 +1066,9 @@ void ChSystemDem_impl::SetBCSpherePosition(size_t bc_id, const float3 pos) {
     BC_params_list_SU[bc_id].sphere_params.sphere_center.x = (int)(pos.x / LENGTH_SU2UU);
     BC_params_list_SU[bc_id].sphere_params.sphere_center.y = (int)(pos.y / LENGTH_SU2UU);
     BC_params_list_SU[bc_id].sphere_params.sphere_center.z = (int)(pos.z / LENGTH_SU2UU);
+    if (demGpuUsesDeviceMemory()) {
+        syncBCParamsListToDevice();
+    }
 }
 
 float3 ChSystemDem_impl::GetBCSphereVelocity(size_t bc_id) const {
@@ -988,6 +1085,9 @@ void ChSystemDem_impl::SetBCSphereVelocity(size_t bc_id, const float3 velo) {
     BC_params_list_SU[bc_id].sphere_params.sphere_velo.x = velo.x / LENGTH_SU2UU * TIME_SU2UU;
     BC_params_list_SU[bc_id].sphere_params.sphere_velo.y = velo.y / LENGTH_SU2UU * TIME_SU2UU;
     BC_params_list_SU[bc_id].sphere_params.sphere_velo.z = velo.z / LENGTH_SU2UU * TIME_SU2UU;
+    if (demGpuUsesDeviceMemory()) {
+        syncBCParamsListToDevice();
+    }
 }
 
 void ChSystemDem_impl::SetBCPlaneRotation(size_t plane_id, double3 rotation_center, double3 rotation_omega) {
@@ -1010,15 +1110,18 @@ bool ChSystemDem_impl::GetBCReactionForces(size_t BC_id, float3& force) const {
         printf("ERROR: Trying to modify reserved BC ID %zu\n", BC_id);
         return false;
     }
-    if (BC_params_list_SU.at(BC_id).track_forces == false) {
+    const BC_params_t<int64_t, int64_t3> bc_params = bcParamsListDevicePtr() != nullptr
+                                                          ? demGpuReadElement(bcParamsListDevicePtr(), BC_id)
+                                                          : BC_params_list_SU[BC_id];
+    if (bc_params.track_forces == false) {
         printf("ERROR: Trying to get forces for non-force-tracking BC ID %zu\n", BC_id);
         return false;
     }
-    if (BC_params_list_SU.at(BC_id).active == false) {
+    if (bc_params.active == false) {
         printf("ERROR: Trying to get forces for inactive BC ID %zu\n", BC_id);
         return false;
     }
-    float3 reaction_forces = BC_params_list_SU.at(BC_id).reaction_forces;
+    float3 reaction_forces = bc_params.reaction_forces;
 
     // conversion from SU to UU force
     force.x = (float)(reaction_forces.x * FORCE_SU2UU);
@@ -1094,8 +1197,8 @@ void ChSystemDem_impl::convertBCUnits() {
                 params_SU.plane_params.normal.z = (float)params_UU.plane_params.normal.z;
 
                 params_SU.plane_params.rotation_center.x = (int64_t)((float)params_UU.plane_params.rotation_center.x / LENGTH_SU2UU);
-                params_SU.plane_params.rotation_center.y = (int64_t)((float)params_UU.plane_params.rotation_center.x / LENGTH_SU2UU);
-                params_SU.plane_params.rotation_center.z = (int64_t)((float)params_UU.plane_params.rotation_center.x / LENGTH_SU2UU);
+                params_SU.plane_params.rotation_center.y = (int64_t)((float)params_UU.plane_params.rotation_center.y / LENGTH_SU2UU);
+                params_SU.plane_params.rotation_center.z = (int64_t)((float)params_UU.plane_params.rotation_center.z / LENGTH_SU2UU);
 
                 params_SU.plane_params.angular_acc.x = params_UU.plane_params.angular_acc.x * TIME_SU2UU;
                 params_SU.plane_params.angular_acc.y = params_UU.plane_params.angular_acc.y * TIME_SU2UU;
@@ -1125,6 +1228,8 @@ void ChSystemDem_impl::convertBCUnits() {
         // always start at rest
         params_SU.vel_SU = {0, 0, 0};
     }
+    syncBCTypeListToDevice();
+    syncBCParamsListToDevice();
 }
 
 void ChSystemDem_impl::initializeSpheres() {
@@ -1147,6 +1252,9 @@ void ChSystemDem_impl::initializeSpheres() {
     runSphereBroadphase();
     INFO_PRINTF("Initial broadphase finished!\n");
 
+    packSphereDataPointers();
+    demGpuPublishManagedToDevice(sphere_data, sizeof(*sphere_data));
+
     int dev_ID;
     demErrchk(gpuGetDevice(&dev_ID));
     // these two will be mostly read by everyone
@@ -1160,6 +1268,13 @@ void ChSystemDem_impl::initializeSpheres() {
     demErrchk(gpuMemAdvise(gran_params, sizeof(*gran_params), gpuMemAdviseSetReadMostly, dev_ID));
     demErrchk(gpuMemAdvise(sphere_data, sizeof(*sphere_data), gpuMemAdviseSetReadMostly, dev_ID));
 #endif
+
+    if (demGpuUsesDeviceMemory()) {
+        INFO_PRINTF("Chrono::DEM HIP device-memory policy active (set CHRONO_DEM_HIP_MANAGED=1 to revert).\n");
+    }
+
+    demGpuAdviseManagedRegion(gran_params, sizeof(*gran_params));
+    demGpuAdviseManagedRegion(sphere_data, sizeof(*sphere_data));
 
     INFO_PRINTF("z grav term with timestep %f is %f\n", stepSize_SU, stepSize_SU * stepSize_SU * gran_params->gravAcc_Z_SU);
     INFO_PRINTF("running at approximate timestep %f\n", stepSize_SU * TIME_SU2UU);
@@ -1177,21 +1292,20 @@ void ChSystemDem_impl::SetParticles(const std::vector<float3>& points, const std
 // }
 
 void ChSystemDem_impl::SetParticleVelocity(int id, const double3& velocity) {
-    // LULUTODO: sphere_data->
-    sphere_data->pos_X_dt[id] = (float)(velocity.x * TIME_SU2UU / LENGTH_SU2UU);
-    sphere_data->pos_Y_dt[id] = (float)(velocity.y * TIME_SU2UU / LENGTH_SU2UU);
-    sphere_data->pos_Z_dt[id] = (float)(velocity.z * TIME_SU2UU / LENGTH_SU2UU);
+    demGpuWriteElement(sphere_data->pos_X_dt, id, (float)(velocity.x * TIME_SU2UU / LENGTH_SU2UU));
+    demGpuWriteElement(sphere_data->pos_Y_dt, id, (float)(velocity.y * TIME_SU2UU / LENGTH_SU2UU));
+    demGpuWriteElement(sphere_data->pos_Z_dt, id, (float)(velocity.z * TIME_SU2UU / LENGTH_SU2UU));
 }
 
 // return position in user units given sphere index
 float3 ChSystemDem_impl::GetParticlePosition(int nSphere) const {
     // owner SD
-    unsigned int ownerSD = sphere_owner_SDs.at(nSphere);
+    unsigned int ownerSD = demGpuReadElement(sphere_owner_SDs.data(), nSphere);
     int3 ownerSD_trip = getSDTripletFromID(ownerSD);
     // local position
-    float x_UU = (float)(sphere_local_pos_X[nSphere] * LENGTH_SU2UU);
-    float y_UU = (float)(sphere_local_pos_Y[nSphere] * LENGTH_SU2UU);
-    float z_UU = (float)(sphere_local_pos_Z[nSphere] * LENGTH_SU2UU);
+    float x_UU = (float)(demGpuReadElement(sphere_local_pos_X.data(), nSphere) * LENGTH_SU2UU);
+    float y_UU = (float)(demGpuReadElement(sphere_local_pos_Y.data(), nSphere) * LENGTH_SU2UU);
+    float z_UU = (float)(demGpuReadElement(sphere_local_pos_Z.data(), nSphere) * LENGTH_SU2UU);
     // add big domain position
     x_UU += (float)(gran_params->BD_frame_X * LENGTH_SU2UU);
     y_UU += (float)(gran_params->BD_frame_Y * LENGTH_SU2UU);
@@ -1217,10 +1331,9 @@ void ChSystemDem_impl::SetParticlePosition(int nSphere, double3 position) {
     int64_t sphCenter_Z_modified = -gran_params->BD_frame_Z + global_pos_Z;
 
     int3 ownerSD;
-    // Get the SD of the sphere's center in the x, y and z direction
-    ownerSD.x = (sphCenter_X_modified / (int64_t)gran_params->SD_size_X_SU);
-    ownerSD.y = (sphCenter_Y_modified / (int64_t)gran_params->SD_size_Y_SU);
-    ownerSD.z = (sphCenter_Z_modified / (int64_t)gran_params->SD_size_Z_SU);
+    ownerSD.x = (int)demDivFloorSD(sphCenter_X_modified, (int64_t)gran_params->SD_size_X_SU);
+    ownerSD.y = (int)demDivFloorSD(sphCenter_Y_modified, (int64_t)gran_params->SD_size_Y_SU);
+    ownerSD.z = (int)demDivFloorSD(sphCenter_Z_modified, (int64_t)gran_params->SD_size_Z_SU);
 
     int ownerSD_x = ownerSD.x;
     int ownerSD_y = ownerSD.y;
@@ -1234,17 +1347,12 @@ void ChSystemDem_impl::SetParticlePosition(int nSphere, double3 position) {
     unsigned int SDID = ownerSD_x * gran_params->nSDs_Y * gran_params->nSDs_Z + ownerSD_y * gran_params->nSDs_Z + ownerSD_z;
 
     // write local pos back to global memory
-    sphere_data->sphere_local_pos_X[nSphere] = sphere_pos_local_X;
-    sphere_data->sphere_local_pos_Y[nSphere] = sphere_pos_local_Y;
-    sphere_data->sphere_local_pos_Z[nSphere] = sphere_pos_local_Z;
-
-    // if (SDID >= gran_params->nSDs) {
-    //     printf("ERROR! Sphere %u has invalid SD %u, max is %u, triplet %d, %d, %d\n", nSphere, SDID,
-    //                     gran_params->nSDs, ownerSD.x, ownerSD.y, ownerSD.z);
-    // }
+    demGpuWriteElement(sphere_data->sphere_local_pos_X, nSphere, sphere_pos_local_X);
+    demGpuWriteElement(sphere_data->sphere_local_pos_Y, nSphere, sphere_pos_local_Y);
+    demGpuWriteElement(sphere_data->sphere_local_pos_Z, nSphere, sphere_pos_local_Z);
 
     // write back which SD currently owns this sphere
-    sphere_data->sphere_owner_SDs[nSphere] = SDID;
+    demGpuWriteElement(sphere_data->sphere_owner_SDs, nSphere, SDID);
 }
 
 float ChSystemDem_impl::ComputeTotalKE() {
@@ -1265,51 +1373,53 @@ float ChSystemDem_impl::ComputeTotalKE() {
 
 // return absolute velocity
 float ChSystemDem_impl::getAbsVelocity(int nSphere) {
-    float absv_SU = std::sqrt(pos_X_dt[nSphere] * pos_X_dt[nSphere] + pos_Y_dt[nSphere] * pos_Y_dt[nSphere] + pos_Z_dt[nSphere] * pos_Z_dt[nSphere]);
+    const float vx = demGpuReadElement(pos_X_dt.data(), nSphere);
+    const float vy = demGpuReadElement(pos_Y_dt.data(), nSphere);
+    const float vz = demGpuReadElement(pos_Z_dt.data(), nSphere);
+    float absv_SU = std::sqrt(vx * vx + vy * vy + vz * vz);
     float absv_UU = (float)(absv_SU * LENGTH_SU2UU / TIME_SU2UU);
     return absv_UU;
 }
 
 // return velocity
 float3 ChSystemDem_impl::GetParticleLinVelocity(int nSphere) const {
-    float vx_UU = (float)(pos_X_dt[nSphere] * LENGTH_SU2UU / TIME_SU2UU);
-    float vy_UU = (float)(pos_Y_dt[nSphere] * LENGTH_SU2UU / TIME_SU2UU);
-    float vz_UU = (float)(pos_Z_dt[nSphere] * LENGTH_SU2UU / TIME_SU2UU);
+    float vx_UU = (float)(demGpuReadElement(pos_X_dt.data(), nSphere) * LENGTH_SU2UU / TIME_SU2UU);
+    float vy_UU = (float)(demGpuReadElement(pos_Y_dt.data(), nSphere) * LENGTH_SU2UU / TIME_SU2UU);
+    float vz_UU = (float)(demGpuReadElement(pos_Z_dt.data(), nSphere) * LENGTH_SU2UU / TIME_SU2UU);
     return make_float3(vx_UU, vy_UU, vz_UU);
 }
 
 // get angular velocity of a particle
 float3 ChSystemDem_impl::GetParticleAngVelocity(int nSphere) const {
-    float wx_UU = sphere_Omega_X.at(nSphere) / TIME_SU2UU;
-    float wy_UU = sphere_Omega_Y.at(nSphere) / TIME_SU2UU;
-    float wz_UU = sphere_Omega_Z.at(nSphere) / TIME_SU2UU;
+    float wx_UU = demGpuReadElement(sphere_Omega_X.data(), nSphere) / TIME_SU2UU;
+    float wy_UU = demGpuReadElement(sphere_Omega_Y.data(), nSphere) / TIME_SU2UU;
+    float wz_UU = demGpuReadElement(sphere_Omega_Z.data(), nSphere) / TIME_SU2UU;
     return make_float3(wx_UU, wy_UU, wz_UU);
 }
 
 // get particle acceleration
 float3 ChSystemDem_impl::GetParticleLinAcc(int nSphere) const {
-    double acc_x = sphere_acc_X.at(nSphere) * LENGTH_SU2UU / (TIME_SU2UU * TIME_SU2UU);
-    double acc_y = sphere_acc_Y.at(nSphere) * LENGTH_SU2UU / (TIME_SU2UU * TIME_SU2UU);
-    double acc_z = sphere_acc_Z.at(nSphere) * LENGTH_SU2UU / (TIME_SU2UU * TIME_SU2UU);
+    double acc_x = demGpuReadElement(sphere_acc_X.data(), nSphere) * LENGTH_SU2UU / (TIME_SU2UU * TIME_SU2UU);
+    double acc_y = demGpuReadElement(sphere_acc_Y.data(), nSphere) * LENGTH_SU2UU / (TIME_SU2UU * TIME_SU2UU);
+    double acc_z = demGpuReadElement(sphere_acc_Z.data(), nSphere) * LENGTH_SU2UU / (TIME_SU2UU * TIME_SU2UU);
 
     return make_float3(acc_x, acc_y, acc_z);
 }
 
 // whether or not the particle is fixed
 bool ChSystemDem_impl::IsFixed(int nSphere) const {
-    return sphere_fixed[nSphere];
+    return demGpuReadElement(sphere_fixed.data(), nSphere) != 0;
 }
 
 // Return number of particle-particle contacts
 unsigned int ChSystemDem_impl::GetNumContacts() const {
-    auto contact_itr = contact_partners_map.begin();
+    std::vector<unsigned int> partners(contact_partners_map.size());
+    if (!partners.empty()) {
+        demGpuCopyToHost(contact_partners_map.data(), partners.data(), partners.size());
+    }
     int total_nc = 0;
-
-    while (contact_itr != contact_partners_map.end()) {
-        int body_j = *contact_itr;
-        contact_itr++;
-
-        if (body_j != -1) {
+    for (unsigned int body_j : partners) {
+        if (body_j != NULL_CHDEM_ID) {
             total_nc++;
         }
     }
@@ -1363,6 +1473,8 @@ void ChSystemDem_impl::partitionBD() {
 
     // permanently cache the initial frame
     BD_rest_frame_SU = make_longlong3(gran_params->BD_frame_X, gran_params->BD_frame_Y, gran_params->BD_frame_Z);
+
+    demGpuPublishManagedToDevice(gran_params, sizeof(*gran_params));
 
     INFO_PRINTF("%u Sds as %u, %u, %u\n", gran_params->nSDs, gran_params->nSDs_X, gran_params->nSDs_Y, gran_params->nSDs_Z);
 
@@ -1470,6 +1582,7 @@ void ChSystemDem_impl::switchToSimUnits() {
     float dt_safe_estimate = (float)std::sqrt(massSphere / K_n_s2s_UU);
     INFO_PRINTF("CFL timestep is about %f\n", dt_safe_estimate);
     INFO_PRINTF("Length unit is %0.16f\n", gran_params->LENGTH_UNIT);
+    demGpuPublishManagedToDevice(gran_params, sizeof(*gran_params));
 }
 }  // namespace dem
 }  // namespace chrono
